@@ -120,6 +120,8 @@ from pycuda.compiler import SourceModule
 import pycuda.gpuarray as gpuarray
 
 tinit = datetime.now()
+print(f"import: {tinit - timport}")
+
 NUM_PRNGS = 1 << (27 - 5)
 PRNG_SEED = 20231229
 
@@ -163,7 +165,8 @@ def gonext(states, index):
 @nb.jit((nb.uint64[:,:], nb.int64), nopython=True, cache=True, nogil=True, fastmath=True)
 def jumpforward(states, index):
     # index = np.int64(index)
-    jump = (np.uint64(0xbeac0467eba5facb), np.uint64(0xd86b048b86aa9922))
+    # jump = (np.uint64(0xbeac0467eba5facb), np.uint64(0xd86b048b86aa9922))
+    jump = np.array((np.uint64(0xbeac0467eba5facb), np.uint64(0xd86b048b86aa9922)), dtype=np.uint64)
     s0 = np.uint64(0)
     s1 = np.uint64(0)
     for i in range(2):
@@ -178,6 +181,8 @@ def jumpforward(states, index):
     return
 
 tsetup = datetime.now()
+print(f"parse and numba jit: {tsetup - tinit}")
+
 init_state(states_cpu, 0, PRNG_SEED)
 for i in tqdm(range(1, NUM_PRNGS)):
     states_cpu[i] = states_cpu[i-1]
@@ -190,6 +195,8 @@ states_gpu = gpuarray.to_gpu(states_cpu)
 
 # CUDA kernel to draw from a uniform distribution
 tkernel = datetime.now()
+print(f"initialize state: {tkernel - tsetup}")
+
 mod = SourceModule("""
 __device__ uint64_t rotl(uint64_t x, uint32_t k) {
     return (x << k) | (x >> (64 - k));
@@ -238,36 +245,91 @@ __global__ void normal(uint64_t *states, float mean, float std, float *draws, ui
         draws[i] = z0 * std + mean;
     }
 }
+
+__global__ void practical(uint64_t *states, float *draws, uint32_t n_draws, uint32_t n_stride) {
+    const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    extern __shared__ uint64_t prns[];
+
+    /*
+    if (tid == 1394) {
+        printf("tid: %d, n_draws: %d, n_stride: %d\\n", tid, n_draws, n_stride);
+        printf("threadIdx.x: %d, blockIdx.x: %d, blockDim.x: %d, gridDim.x: %d\\n", threadIdx.x, blockIdx.x, blockDim.x, gridDim.x);
+    }
+    */
+
+    const uint32_t thidx = threadIdx.x; // index of this thread w/in the block
+    // printf("[%d]- thidx: %d\\n", tid, thidx);
+    if ((thidx % n_stride) == 0) {                              // if this thread is the first in its stride
+        // printf("[%d]- thidx: %d, n_stride: %d\\n", tid, thidx, n_stride);
+        for (uint32_t i = 0; i < n_stride; ++i) {               // then get the next n_stride PRNs
+            prns[thidx + i] = get_next(states, tid / n_stride); // and store them in shared memory
+            // printf("[%d]- prns[%d] = get_next(%d) [%ld]\\n", tid, thidx + i, tid / n_stride, prns[thidx + i]);
+        }
+    }
+    else {
+        // printf("[%d]- waiting\\n", tid);
+    }
+    __syncthreads();
+
+    draws[tid] = uint64_to_unit_float32(prns[thidx]);   // use the PRN stored above
+    // printf("[%d]- draws[%d] (%f) = uniform(prns[%d]=%ld)\\n", tid, tid, draws[tid], thidx, prns[thidx]);
+}
 """)
 uniform = mod.get_function("uniform")
 normal = mod.get_function("normal")
+
 tdraw = datetime.now()
+print(f"compile kernel: {tdraw - tkernel}")
+
 draws = gpuarray.empty((NUM_PRNGS,), dtype=np.float32)
 NUM_THREAD = 128
 NUM_BLOCKS = NUM_PRNGS // NUM_THREAD + 1
 uniform(states_gpu, draws, np.uint32(NUM_PRNGS), block=(NUM_THREAD,1,1), grid=(NUM_BLOCKS,1,1))
 pycuda.autoinit.context.synchronize()
-tuniform = datetime.now()
 
-with Path("uniform.csv").open("w") as file:
-    for value in draws.get():
-        file.write(f"{value}\n")
+tuniform = datetime.now()
+print(f"{NUM_PRNGS} uniform draws: {tuniform - tdraw}")
+
+# with Path("uniform.csv").open("w") as file:
+#     for value in draws.get():
+#         file.write(f"{value}\n")
 
 tdraw2 = datetime.now()
-normal(states_gpu, np.float32(0), np.float32(1), draws, np.uint32(NUM_PRNGS), block=(NUM_THREAD,1,1), grid=(NUM_BLOCKS,1,1))
+# print(f"write uniform draws CSV: {tdraw2 - tuniform}")
+
+normal(states_gpu, np.float32(5), np.float32(1.5), draws, np.uint32(NUM_PRNGS), block=(NUM_THREAD,1,1), grid=(NUM_BLOCKS,1,1))
 pycuda.autoinit.context.synchronize()
+
 tfinish = datetime.now()
+print(f"{NUM_PRNGS} normal draws: {tfinish - tdraw2}")
 
-print(f"{NUM_PRNGS:_} draws from {NUM_PRNGS} PRNGs (support {NUM_PRNGS * 1 << 5} agents?)")
-print(f"import: {tinit - timport}")
-print(f"init: {tsetup - tinit}")
-print(f"setup: {tkernel - tsetup}")
-print(f"kernel: {tdraw - tkernel}")
-print(f"uniform: {tuniform - tdraw}")
-print(f"normal: {tfinish - tdraw2}")
+print(f"{NUM_PRNGS:_} draws from {NUM_PRNGS} PRNGs (support {(NUM_PRNGS * 1 << 5):_} agents?)")
 
-with Path("normal.csv").open("w") as file:
-    for value in draws.get():
-        file.write(f"{value}\n")
+# with Path("normal.csv").open("w") as file:
+#     for value in draws.get():
+#         file.write(f"{value}\n")
+
+tfinal = datetime.now()
+# print(f"write normal draws CSV: {tfinal - tfinish}")
+print(f"Total elapsed time: {tfinal - tinit}")
+
+practical = mod.get_function("practical")
+# print(f"{states_gpu.get()[0:64]}")
+# print(f"{draws.get()[0:16]}")
+
+PRNG_STRIDE = 16
+NUM_DRAWS = NUM_PRNGS * PRNG_STRIDE
+NUM_BLOCKS = NUM_DRAWS // NUM_THREAD
+print(f"practical(states_gpu, draws, np.uint32({NUM_DRAWS}), np.uint32({PRNG_STRIDE}), block=({NUM_THREAD},1,1), grid=({NUM_BLOCKS},1,1), shared={NUM_THREAD * 8})")
+drawstoo = gpuarray.empty((NUM_DRAWS,), dtype=np.float32)
+print(f"{drawstoo.get()[0:16]}")
+t0 = datetime.now()
+practical(states_gpu, drawstoo, np.uint32(NUM_DRAWS), np.uint32(PRNG_STRIDE), block=(NUM_THREAD,1,1), grid=(NUM_BLOCKS,1,1), shared=NUM_THREAD * 8)
+pycuda.autoinit.context.synchronize()
+t1 = datetime.now()
+print(f"{NUM_DRAWS} practical draws: {t1 - t0}")
+# print(f"{states_gpu.get()[0:64]}")
+print(f"{drawstoo.get()[0:16]}")
 
 pass
