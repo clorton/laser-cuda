@@ -146,13 +146,10 @@ def init_state(states, index, seed):
 @nb.jit((nb.uint64, nb.uint32), nopython=True, cache=True, nogil=True, fastmath=True)
 def rotl(x, k):
     '''Left rotate x by k bits.'''
-    # x = np.uint64(x)
-    # k = np.uint32(k)
     return (x << k) | (x >> np.uint32(64 - k))
 
 @nb.jit((nb.uint64[:,:], nb.int64), nopython=True, cache=True, nogil=True, fastmath=True)
 def gonext(states, index):
-    # index = np.int64(index)
     s0, s1 = states[index]
     result = s0 + s1
 
@@ -164,8 +161,6 @@ def gonext(states, index):
 
 @nb.jit((nb.uint64[:,:], nb.int64), nopython=True, cache=True, nogil=True, fastmath=True)
 def jumpforward(states, index):
-    # index = np.int64(index)
-    # jump = (np.uint64(0xbeac0467eba5facb), np.uint64(0xd86b048b86aa9922))
     jump = np.array((np.uint64(0xbeac0467eba5facb), np.uint64(0xd86b048b86aa9922)), dtype=np.uint64)
     s0 = np.uint64(0)
     s1 = np.uint64(0)
@@ -191,24 +186,24 @@ for i in tqdm(range(1, NUM_PRNGS)):
 # 3. copy to GPU
 states_gpu = gpuarray.to_gpu(states_cpu)
 
-# 4. return gpuarray from 3
-
-# CUDA kernel to draw from a uniform distribution
+# CUDA kernels to draw from uniform and normal distributions
 tkernel = datetime.now()
 print(f"initialize state: {tkernel - tsetup}")
 
 mod = SourceModule("""
-__device__ uint64_t rotl(uint64_t x, uint32_t k) {
+// Helper for XOROSHIRO128+ PRNG
+__device__ inline uint64_t rotl(uint64_t x, uint32_t k) {
     return (x << k) | (x >> (64 - k));
 }
 
 #define FACTOR (double(1.0) / 9007199254740992)
 
-__device__ float uint64_to_unit_float32(uint64_t x) {
+__device__ inline float uint64_to_unit_float32(uint64_t x) {
     return float((x >> 11) * FACTOR);
 }
 
 __device__ uint64_t get_next(uint64_t *states, uint32_t index) {
+
     uint64_t s0 = states[index*2];
     uint64_t s1 = states[index*2+1];
     uint64_t result = s0 + s1;
@@ -224,67 +219,50 @@ __device__ uint64_t get_next(uint64_t *states, uint32_t index) {
 }
 
 __global__ void uniform(uint64_t *states, float *draws, uint32_t n_draws) {
-    const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-    const uint32_t stride = blockDim.x * gridDim.x;
 
-    for (uint32_t i = tid; i < n_draws; i += stride) {
-        draws[i] = uint64_to_unit_float32(get_next(states, i));
-    }
+    const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    draws[tid] = uint64_to_unit_float32(get_next(states, tid));
 }
 
 #define TWO_PI  (float(2.0 * 3.14159265))
 
 __global__ void normal(uint64_t *states, float mean, float std, float *draws, uint32_t n_draws) {
-    const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-    const uint32_t stride = blockDim.x * gridDim.x;
 
-    for (uint32_t i = tid; i < n_draws; i += stride) {
-        float u1 = uint64_to_unit_float32(get_next(states, i));
-        float u2 = uint64_to_unit_float32(get_next(states, i));
-        float z0 = sqrt(-2 * log(u1)) * cos(TWO_PI * u2);
-        draws[i] = z0 * std + mean;
-    }
+    const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    float u1 = uint64_to_unit_float32(get_next(states, tid));
+    float u2 = uint64_to_unit_float32(get_next(states, tid));
+    float z0 = sqrt(-2 * log(u1)) * cos(TWO_PI * u2);
+    draws[tid] = z0 * std + mean;
 }
 
 __global__ void practical(uint64_t *states, float *draws, uint32_t n_draws, uint32_t n_stride) {
+
     const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
 
     extern __shared__ uint64_t prns[];
 
-    /*
-    if (tid == 1394) {
-        printf("tid: %d, n_draws: %d, n_stride: %d\\n", tid, n_draws, n_stride);
-        printf("threadIdx.x: %d, blockIdx.x: %d, blockDim.x: %d, gridDim.x: %d\\n", threadIdx.x, blockIdx.x, blockDim.x, gridDim.x);
-    }
-    */
-
-    const uint32_t thidx = threadIdx.x; // index of this thread w/in the block
-    // printf("[%d]- thidx: %d\\n", tid, thidx);
+    const uint32_t thidx = threadIdx.x;                         // index of this thread w/in the block
     if ((thidx % n_stride) == 0) {                              // if this thread is the first in its stride
-        // printf("[%d]- thidx: %d, n_stride: %d\\n", tid, thidx, n_stride);
         for (uint32_t i = 0; i < n_stride; ++i) {               // then get the next n_stride PRNs
             prns[thidx + i] = get_next(states, tid / n_stride); // and store them in shared memory
-            // printf("[%d]- prns[%d] = get_next(%d) [%ld]\\n", tid, thidx + i, tid / n_stride, prns[thidx + i]);
         }
-    }
-    else {
-        // printf("[%d]- waiting\\n", tid);
     }
     __syncthreads();
 
     draws[tid] = uint64_to_unit_float32(prns[thidx]);   // use the PRN stored above
-    // printf("[%d]- draws[%d] (%f) = uniform(prns[%d]=%ld)\\n", tid, tid, draws[tid], thidx, prns[thidx]);
 }
 """)
 uniform = mod.get_function("uniform")
 normal = mod.get_function("normal")
+practical = mod.get_function("practical")
 
 tdraw = datetime.now()
 print(f"compile kernel: {tdraw - tkernel}")
 
 draws = gpuarray.empty((NUM_PRNGS,), dtype=np.float32)
-NUM_THREAD = 128
-NUM_BLOCKS = NUM_PRNGS // NUM_THREAD + 1
+NUM_THREAD = 256
+NUM_BLOCKS = NUM_PRNGS // NUM_THREAD
 uniform(states_gpu, draws, np.uint32(NUM_PRNGS), block=(NUM_THREAD,1,1), grid=(NUM_BLOCKS,1,1))
 pycuda.autoinit.context.synchronize()
 
@@ -314,22 +292,17 @@ tfinal = datetime.now()
 # print(f"write normal draws CSV: {tfinal - tfinish}")
 print(f"Total elapsed time: {tfinal - tinit}")
 
-practical = mod.get_function("practical")
-# print(f"{states_gpu.get()[0:64]}")
-# print(f"{draws.get()[0:16]}")
-
-PRNG_STRIDE = 16
+PRNG_STRIDE = 32
 NUM_DRAWS = NUM_PRNGS * PRNG_STRIDE
 NUM_BLOCKS = NUM_DRAWS // NUM_THREAD
 print(f"practical(states_gpu, draws, np.uint32({NUM_DRAWS}), np.uint32({PRNG_STRIDE}), block=({NUM_THREAD},1,1), grid=({NUM_BLOCKS},1,1), shared={NUM_THREAD * 8})")
 drawstoo = gpuarray.empty((NUM_DRAWS,), dtype=np.float32)
-print(f"{drawstoo.get()[0:16]}")
+print(f"{drawstoo[0:16]}")
 t0 = datetime.now()
 practical(states_gpu, drawstoo, np.uint32(NUM_DRAWS), np.uint32(PRNG_STRIDE), block=(NUM_THREAD,1,1), grid=(NUM_BLOCKS,1,1), shared=NUM_THREAD * 8)
 pycuda.autoinit.context.synchronize()
 t1 = datetime.now()
 print(f"{NUM_DRAWS} practical draws: {t1 - t0}")
-# print(f"{states_gpu.get()[0:64]}")
-print(f"{drawstoo.get()[0:16]}")
+print(f"{drawstoo[0:16]}")
 
 pass
