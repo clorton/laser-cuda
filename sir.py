@@ -120,7 +120,7 @@ from pycuda.compiler import SourceModule
 import pycuda.gpuarray as gpuarray
 from pycuda.reduction import ReductionKernel
 
-POP_SIZE = 1 << 28  # 1_048_576
+POP_SIZE = 1 << 20  # 1_048_576
 INIT_COUNT = 10
 INF_MEAN = 5
 INF_STD = 1
@@ -190,6 +190,11 @@ sumc = ReductionKernel(np.uint32, neutral="0",
 
 R_ZERO = 2.5
 BETA = R_ZERO / INF_MEAN
+
+# allocate PRNG state
+# initialize PRNG state
+# draw random numbers from the uniform distribution
+# draw random numbers from the normal distribution
 
 # run transmission kernel
 # mod = SourceModule("""

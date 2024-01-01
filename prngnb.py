@@ -302,7 +302,7 @@ t0 = datetime.now()
 practical(states_gpu, drawstoo, np.uint32(NUM_DRAWS), np.uint32(PRNG_STRIDE), block=(NUM_THREAD,1,1), grid=(NUM_BLOCKS,1,1), shared=NUM_THREAD * 8)
 pycuda.autoinit.context.synchronize()
 t1 = datetime.now()
-print(f"{NUM_DRAWS} practical draws: {t1 - t0}")
+print(f"{NUM_DRAWS:_} practical draws: {t1 - t0}")
 print(f"{drawstoo[0:16]}")
 
 pass
