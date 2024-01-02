@@ -107,6 +107,7 @@ environment = {
 os.environ.update(environment)
 
 from argparse import ArgumentParser
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -129,7 +130,13 @@ def kernels():
     exposure_update = mod.get_function("exposure_update")
     transmission_update = mod.get_function("transmission_update")
 
-    sumnz = ReductionKernel(np.uint32, neutral="0", reduce_expr="a+b", map_expr="x[i] != 0 ? 1 : 0", arguments="unsigned char *x")
+    sumnz = ReductionKernel(
+        np.uint32,                      # output type
+        neutral="0",                    # neutral element
+        reduce_expr="a+b",              # reduce expression
+        map_expr="(x[i] != 0) ? 1 : 0", # map expression
+        arguments="unsigned char *x"    # arguments
+        )
 
     return infect, infection_update, exposure_update, transmission_update, sumnz
 
@@ -219,10 +226,10 @@ def main(params):
     results = np.zeros((params.timesteps+1, 5), dtype=np.uint32)
 
     NUM_THREADS = 256
-    NUM_BLOCKS = np.ceil(params.pop_size / NUM_THREADS).astype(np.uint32)
+    NUM_BLOCKS = int(np.ceil(params.pop_size / NUM_THREADS))
 
     # infect initial agents
-    targets_gpu = gpuarray.to_gpu(np.random.choice(params.pop_size, size=params.initial, replace=False).astype(np.uint32))
+    targets_gpu = gpuarray.to_gpu(np.random.choice(params.pop_size, size=params.initial, replace=False).astype(np.uint32).reshape((10,1)))
     infect(
         params.initial, targets_gpu,
         prng_states,
@@ -232,6 +239,7 @@ def main(params):
         )
 
     # run the simulation
+    tstart = datetime.now()
     record_state(0, sumnz, sus_gpu, exp_gpu, inf_gpu, params.pop_size, results)
     for timestep in tqdm(range(params.timesteps)):
 
@@ -245,22 +253,27 @@ def main(params):
             exp_gpu,
             prng_states, params.prng_stride,
             inf_gpu, params.inf_mean, params.inf_std,
-            block=(NUM_THREADS, 1, 1), grid=(NUM_BLOCKS, 1, 1), shared=NUM_THREADS * 8)
+            block=(NUM_THREADS, 1, 1), grid=(NUM_BLOCKS, 1, 1), shared=NUM_THREADS * 16)
 
         contagion = np.uint32(sumnz(inf_gpu).get())
         force = params.beta * contagion / params.pop_size
         transmission_update(
-            params.pop_size,
-            prng_states, params.prng_stride,
-            force, sus_gpu,
-            exp_gpu, params.exp_mean, params.exp_std,
-            block=(NUM_THREADS, 1, 1), grid=(NUM_BLOCKS, 1, 1), shared=NUM_THREADS * 8)
+            np.uint64(params.pop_size),
+            prng_states, np.uint64(params.prng_stride),
+            np.float64(force),
+            sus_gpu,
+            exp_gpu, np.float64(params.exp_mean), np.float64(params.exp_std),
+            block=(NUM_THREADS, 1, 1), grid=(NUM_BLOCKS, 1, 1), shared=NUM_THREADS * 16)
 
+        contagion = np.uint32(sumnz(inf_gpu).get())
         record_state(timestep+1, sumnz, sus_gpu, exp_gpu, inf_gpu, params.pop_size, results)
+    tfinish = datetime.now()
+    print(f"Simulation took {tfinish - tstart}.")
 
     # convert results to a Polars DataFrame
-    df = pl.DataFrame(results, columns=["timestep", "S", "E", "I", "R"])
+    df = pl.DataFrame(results, schema=["timestep", "S", "E", "I", "R"])
     # write to CSV
+    print(f"Writing results to fullseir.csv...")
     df.write_csv("fullseir.csv")
 
     return
